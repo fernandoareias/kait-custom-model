@@ -24,5 +24,5 @@ setup(
             "kait = kait.main:cli",
         ],
     },
-    python_requires=">=3.8, <3.12",
+    python_requires=">=3.8",
 )
