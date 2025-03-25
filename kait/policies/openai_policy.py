@@ -369,3 +369,41 @@ class OpenAIStrategy(LLMStrategy):
         """
         print(f"[CONFIG] Returning config list with model: {self.model_name}")
         return [{"endpoint": self.endpoint, "api_key": self.api_key, "model": self.model_name}] 
+
+    def test_connection(self) -> bool:
+        """Test the connection to the Azure OpenAI API.
+        
+        Returns:
+            bool: True if the connection is successful, False otherwise.
+        """
+        try:
+            print(f"[TEST] Testing connection to {self.endpoint}")
+            
+            # Simple completion request to test connection
+            response = self.client.complete(
+                messages=[UserMessage(content="Tell me hello")],
+                max_tokens=10,
+                temperature=0.7,
+                top_p=0.95,
+                model=self.model_name,
+            )
+            
+            # Check if we got a valid response
+            if response and hasattr(response, 'choices') and len(response.choices) > 0:
+                print(f"[TEST] Connection test successful")
+                print(f"[TEST] Response: {response.choices[0].message.content}")
+                return True
+            else:
+                print(f"[TEST] Connection test failed: Empty response")
+                return False
+                
+        except ClientAuthenticationError as e:
+            print(f"[TEST] Authentication error: {str(e)}")
+            return False
+        except ServiceRequestError as e:
+            print(f"[TEST] Service request error: {str(e)}")
+            return False
+        except Exception as e:
+            print(f"[TEST] Unexpected error: {str(e)}")
+            traceback.print_exc()
+            return False 

@@ -26,6 +26,8 @@ class KubernetesDebugger:
         input_mode: str = "NEVER",
         max_replies: int = 10,
         policy: Optional[str] = None,
+        verbose: bool = False,
+        direct: bool = False,
         **kwargs,
     ):
         """Initialize the KubernetesDebugger.
@@ -36,6 +38,8 @@ class KubernetesDebugger:
             input_mode (str, optional): The input mode. Defaults to "NEVER".
             max_replies (int, optional): The maximum number of replies. Defaults to 10.
             policy (Optional[str], optional): The LLM policy to use. Defaults to None.
+            verbose (bool, optional): Whether to enable verbose logging. Defaults to False.
+            direct (bool, optional): Whether to use direct API call instead of agent framework. Defaults to False.
             **kwargs: Additional keyword arguments to pass to the LLM strategy.
         """
         print("[DEBUG-KUBE] Initializing KubernetesDebugger")
@@ -43,22 +47,35 @@ class KubernetesDebugger:
         self.output_file = output_file
         self.input_mode = input_mode
         self.max_replies = max_replies
+        self.verbose = verbose or kwargs.get('verbose', False)
+        self.direct = direct or kwargs.get('direct', False)
 
-        print(f"[DEBUG-KUBE] Getting LLM strategy for policy: {policy}")
+        if self.verbose:
+            print(f"[DEBUG-KUBE] Getting LLM strategy for policy: {policy}")
         self.llm_strategy = get_llm_strategy(policy, **kwargs)
-        print("[DEBUG-KUBE] LLM strategy obtained")
+        if self.verbose:
+            print("[DEBUG-KUBE] LLM strategy obtained")
         
         self.config_list = self.llm_strategy.get_config_list()
-        print(f"[DEBUG-KUBE] Config list: {self.config_list}")
-
-        print("[DEBUG-KUBE] Setting up kubernetes admin agent")
-        self.kubernetes_agent = self._setup_kubernetes_admin_agent()
-        print("[DEBUG-KUBE] Kubernetes admin agent setup completed")
-        
-        print("[DEBUG-KUBE] Setting up code executor agent")
-        self.code_agent = self._setup_code_executor_agent()
-        print("[DEBUG-KUBE] Code executor agent setup completed")
-        print("[DEBUG-KUBE] KubernetesDebugger initialized successfully")
+        if self.verbose:
+            print(f"[DEBUG-KUBE] Config list: {self.config_list}")
+            
+        # If using direct mode, we don't need to set up the agents
+        if not self.direct:
+            if self.verbose:
+                print("[DEBUG-KUBE] Setting up kubernetes admin agent")
+            self.kubernetes_agent = self._setup_kubernetes_admin_agent()
+            if self.verbose:
+                print("[DEBUG-KUBE] Kubernetes admin agent setup completed")
+            
+            if self.verbose:
+                print("[DEBUG-KUBE] Setting up code executor agent")
+            self.code_agent = self._setup_code_executor_agent()
+            if self.verbose:
+                print("[DEBUG-KUBE] Code executor agent setup completed")
+                
+        if self.verbose:
+            print("[DEBUG-KUBE] KubernetesDebugger initialized successfully")
 
     def _setup_kubernetes_admin_agent(self):
         """Set up the kubernetes admin agent.
@@ -218,19 +235,20 @@ or you have no code left to run, respond with 'TERMINATE'.
         return code_executor_agent
 
     def debug(self, request):
-        """Start debugging session for the given request.
+        """
+        Debugs and fixes kubernetes issues.
 
         Args:
-        ----
-        request (str): User provided description of the problem to solve.
+            request (str): A string representing the problem to be fixed.
+
+        Returns:
+            None
         """
-        print("[DEBUG-KUBE] Inside debug method with request")
-        try:
-            print(f"[DEBUG-KUBE] Initiating chat with user request: {request[:50]}...")
-            self.code_agent.initiate_chat(
-                self.kubernetes_agent,
-                silent=True,
-                message=f"""
+        if self.verbose:
+            print("[DEBUG-KUBE] Inside debug method with request")
+            
+        # Format user request
+        message = f"""
 You are an expert Kubernetes administrator and your job is to resolve the issue
 described below using kubectl. You are already authenticated with the cluster.
 
@@ -239,10 +257,124 @@ described below using kubectl. You are already authenticated with the cluster.
 
 
 Diagnose and fix the issue using kubectl.
-""",
+"""
+        if self.verbose:
+            print(f"[DEBUG-KUBE] Initiating chat with user request: {request[:50]}...")
+        
+        # If direct mode is enabled, use direct API call
+        if self.direct:
+            return self._direct_debug(message)
+        
+        try:
+            # Initiate chat
+            response = self.code_agent.initiate_chat(
+                self.kubernetes_agent, 
+                silent=True,
+                message=message,
             )
-            print("[DEBUG-KUBE] Chat initiated successfully")
+            
+            if self.verbose:
+                print(f"[DEBUG-KUBE] Chat completed with response: {str(response)[:50]}...")
+            
+            # If an output file is specified, write the conversation to it
+            if self.output_file and hasattr(self.code_agent, 'chat_messages') and self.code_agent.chat_messages:
+                try:
+                    with open(self.output_file, "a", encoding="UTF-8") as file:
+                        for msg in self.code_agent.chat_messages:
+                            if msg.get("role") == "assistant" and msg.get("content"):
+                                file.write(msg.get("content", "") + "\n\n")
+                    if self.verbose:
+                        print(f"[DEBUG-KUBE] Response written to output file: {self.output_file}")
+                except Exception as e:
+                    print(f"[ERROR-KUBE] Failed to write to output file: {str(e)}")
+            
+            return response
+            
         except Exception as e:
-            print(f"[ERROR-KUBE] Error in debug method: {e}")
-            print(traceback.format_exc())
-            raise
+            print(f"[ERROR-KUBE] Error in debug: {str(e)}")
+            if self.verbose:
+                import traceback
+                print(traceback.format_exc())
+            
+            # If there's an error, try a direct call to get a response
+            return self._direct_debug(message)
+    
+    def _direct_debug(self, message):
+        """
+        Make a direct API call to the LLM provider.
+        
+        Args:
+            message (str): The message to send to the LLM provider.
+            
+        Returns:
+            str: The response from the LLM provider.
+        """
+        if self.verbose:
+            print("[DEBUG-KUBE] Using direct API call")
+            
+        # Check if we have a valid OpenAI strategy
+        if self.llm_strategy.__class__.__name__ != "OpenAIStrategy" or not hasattr(self.llm_strategy, 'endpoint') or not hasattr(self.llm_strategy, 'api_key'):
+            print("[ERROR-KUBE] Direct mode requires OpenAI strategy with valid endpoint and API key")
+            return None
+            
+        try:
+            from azure.ai.inference import ChatCompletionsClient
+            from azure.ai.inference.models import UserMessage
+            from azure.core.credentials import AzureKeyCredential
+            import re
+            
+            endpoint = self.llm_strategy.endpoint
+            api_key = self.llm_strategy.api_key
+            
+            # Extract model name from endpoint URL
+            match = re.search(r"/deployments/([^/]+)/?", endpoint)
+            if not match:
+                print("[ERROR] Invalid endpoint URL format")
+                return None
+                
+            model_name = match.group(1)
+            
+            if self.verbose:
+                print(f"[DEBUG-KUBE] Making direct API call to {endpoint}")
+                print(f"[DEBUG-KUBE] Using model: {model_name}")
+            
+            # Create client and make direct call
+            client = ChatCompletionsClient(
+                endpoint=endpoint,
+                credential=AzureKeyCredential(api_key),
+            )
+            
+            if self.verbose:
+                print("[DEBUG-KUBE] Sending request...")
+                
+            response = client.complete(
+                messages=[UserMessage(content=message)],
+                max_tokens=4000,
+                temperature=0.7,
+                top_p=0.95,
+                model=model_name,
+            )
+            
+            content = response.choices[0].message.content
+            
+            if self.verbose:
+                print("[DEBUG-KUBE] Response received successfully")
+            
+            print("\n=== RESPONSE ===")
+            print(content)
+            print("===============\n")
+            
+            # Save to output file if provided
+            if self.output_file:
+                with open(self.output_file, "a", encoding="utf-8") as f:
+                    f.write(content)
+                if self.verbose:
+                    print(f"[DEBUG-KUBE] Response saved to {self.output_file}")
+                    
+            return content
+        except Exception as e:
+            print(f"[ERROR-KUBE] Failed to get direct response: {str(e)}")
+            if self.verbose:
+                import traceback
+                print(traceback.format_exc())
+            return None
