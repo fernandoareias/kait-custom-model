@@ -28,6 +28,7 @@ class KubernetesDebugger:
         policy: Optional[str] = None,
         verbose: bool = False,
         direct: bool = False,
+        execute: bool = False,
         **kwargs,
     ):
         """Initialize the KubernetesDebugger.
@@ -40,6 +41,7 @@ class KubernetesDebugger:
             policy (Optional[str], optional): The LLM policy to use. Defaults to None.
             verbose (bool, optional): Whether to enable verbose logging. Defaults to False.
             direct (bool, optional): Whether to use direct API call instead of agent framework. Defaults to False.
+            execute (bool, optional): Whether to execute the suggested commands. Defaults to False.
             **kwargs: Additional keyword arguments to pass to the LLM strategy.
         """
         print("[DEBUG-KUBE] Initializing KubernetesDebugger")
@@ -49,6 +51,7 @@ class KubernetesDebugger:
         self.max_replies = max_replies
         self.verbose = verbose or kwargs.get('verbose', False)
         self.direct = direct or kwargs.get('direct', False)
+        self.execute = execute or kwargs.get('execute', False)
 
         if self.verbose:
             print(f"[DEBUG-KUBE] Getting LLM strategy for policy: {policy}")
@@ -96,8 +99,8 @@ You can propose changes for the end user to run to fix the command afterwards.
         print("[DEBUG-KUBE] Creating kubernetes_agent with llm_strategy")
         try:
             kubernetes_agent = self.llm_strategy.create_agent(
-                name="kait",
-                system_message=f"""
+            name="kait",
+            system_message=f"""
 # Your Role
 You are an expert Kubernetes administrator and your job is to resolve issues relating to
 Kubernetes deployments using kubectl. Do not try and debug the issue with the containers themselves
@@ -131,16 +134,16 @@ Don't ask if the user needs any further assistance, simply reply with 'TERMINATE
 have completed the task to the best of your abilities. If you need the user to save code to a file
 or you have no code left to run, respond with 'TERMINATE'.
 """,
-                llm_config={
-                    "timeout": 600,
-                    "cache_seed": 42,
-                    "config_list": self.config_list,
-                    "temperature": 0,
-                },
-                code_execution_config={
-                    "use_docker": False,
-                },
-            )
+            llm_config={
+                "timeout": 600,
+                "cache_seed": 42,
+                "config_list": self.config_list,
+                "temperature": 0,
+            },
+            code_execution_config={
+                "use_docker": False,
+            },
+        )
             print("[DEBUG-KUBE] kubernetes_agent created successfully")
         except Exception as e:
             print(f"[ERROR-KUBE] Failed to create kubernetes_agent: {e}")
@@ -252,11 +255,20 @@ or you have no code left to run, respond with 'TERMINATE'.
 You are an expert Kubernetes administrator and your job is to resolve the issue
 described below using kubectl. You are already authenticated with the cluster.
 
+IMPORTANT: You must provide commands to fix the issue, one at a time. Each command should be in a code block.
+Do not use placeholders like <pod-name> or <namespace>. Use real resource names.
+For logs, limit output with --tail=10 to show only recent logs.
 
+PROBLEM:
 {request}
 
+Diagnose and fix the issue by following these steps:
+1. First, investigate the issue using read-only commands (get, describe, logs)
+2. Identify the root cause of the problem
+3. Apply the necessary fixes using kubectl commands
+4. Verify your fix has resolved the issue
 
-Diagnose and fix the issue using kubectl.
+Provide your reasoning at each step and be thorough in your diagnosis.
 """
         if self.verbose:
             print(f"[DEBUG-KUBE] Initiating chat with user request: {request[:50]}...")
@@ -266,28 +278,82 @@ Diagnose and fix the issue using kubectl.
             return self._direct_debug(message)
         
         try:
-            # Initiate chat
+            # Ensure the agent is properly set up
+            if not hasattr(self, 'kubernetes_agent') or not hasattr(self, 'code_agent'):
+                print("[ERROR-KUBE] Agents not properly initialized")
+                raise RuntimeError("Agents not properly initialized")
+                
+            # Set system message for kubernetes agent if not already set
+            if hasattr(self.kubernetes_agent, 'system_message') and not self.kubernetes_agent.system_message:
+                self.kubernetes_agent.system_message = """
+You are an expert Kubernetes administrator. Your job is to diagnose and fix Kubernetes issues.
+Always be thorough in your analysis and provide clear explanations along with your commands.
+"""
+            
+            # Initiate chat with clear instructions
+            print("[DEBUG-KUBE] Starting agent conversation...")
             response = self.code_agent.initiate_chat(
                 self.kubernetes_agent, 
-                silent=True,
+                silent=not self.verbose,  # Make verbose mode actually show the conversation
                 message=message,
             )
             
             if self.verbose:
-                print(f"[DEBUG-KUBE] Chat completed with response: {str(response)[:50]}...")
+                print(f"[DEBUG-KUBE] Chat completed with response: {str(response)[:100]}...")
+            
+            # Check if we got a valid response
+            if not response or (isinstance(response, dict) and not response.get('chat_history')):
+                print("[DEBUG-KUBE] No valid response from agent conversation, falling back to direct API call")
+                direct_response = self._direct_debug(message)
+                
+                # If an output file is specified, write the direct response to it
+                if self.output_file and direct_response:
+                    try:
+                        with open(self.output_file, "a", encoding="UTF-8") as file:
+                            file.write("\n## Direct API Response\n\n")
+                            file.write(direct_response)
+                    except Exception as e:
+                        print(f"[ERROR-KUBE] Failed to write direct response to output file: {str(e)}")
+                
+                return direct_response
             
             # If an output file is specified, write the conversation to it
-            if self.output_file and hasattr(self.code_agent, 'chat_messages') and self.code_agent.chat_messages:
+            if self.output_file:
                 try:
+                    # Get chat history from response if available
+                    chat_history = []
+                    if hasattr(response, 'chat_history'):
+                        chat_history = response.chat_history
+                    elif hasattr(response, 'chat_id') and hasattr(response, 'chat_history'):
+                        chat_history = response.chat_history
+                    elif isinstance(response, dict) and 'chat_history' in response:
+                        chat_history = response['chat_history']
+                        
                     with open(self.output_file, "a", encoding="UTF-8") as file:
-                        for msg in self.code_agent.chat_messages:
-                            if msg.get("role") == "assistant" and msg.get("content"):
-                                file.write(msg.get("content", "") + "\n\n")
+                        file.write("\n## Debugging Session\n\n")
+                        
+                        # If we have chat history, write it to the file
+                        if chat_history:
+                            for msg in chat_history:
+                                if isinstance(msg, dict):
+                                    role = msg.get("role", "")
+                                    content = msg.get("content", "")
+                                    
+                                    if role == "assistant" and content:
+                                        file.write(f"### KAIT Analysis\n{content}\n\n")
+                                    elif role == "user" and content and content.startswith("Code output:"):
+                                        file.write(f"### Command Output\n```\n{content.replace('Code output:', '')}\n```\n\n")
+                                        
+                        # If no chat history, write a summary of the debug session
+                        else:
+                            file.write(f"### Debug Summary\n\nKAIT has analyzed the issue: '{request[:100]}...'\n\n")
+                            
                     if self.verbose:
-                        print(f"[DEBUG-KUBE] Response written to output file: {self.output_file}")
+                        print(f"[DEBUG-KUBE] Results written to output file: {self.output_file}")
                 except Exception as e:
                     print(f"[ERROR-KUBE] Failed to write to output file: {str(e)}")
             
+            print("[DEBUG-KUBE] Debug session completed successfully")
             return response
             
         except Exception as e:
@@ -297,6 +363,7 @@ Diagnose and fix the issue using kubectl.
                 print(traceback.format_exc())
             
             # If there's an error, try a direct call to get a response
+            print("[DEBUG-KUBE] Falling back to direct API call due to error")
             return self._direct_debug(message)
     
     def _direct_debug(self, message):
@@ -319,7 +386,7 @@ Diagnose and fix the issue using kubectl.
             
         try:
             from azure.ai.inference import ChatCompletionsClient
-            from azure.ai.inference.models import UserMessage
+            from azure.ai.inference.models import UserMessage, SystemMessage
             from azure.core.credentials import AzureKeyCredential
             import re
             
@@ -346,9 +413,26 @@ Diagnose and fix the issue using kubectl.
             
             if self.verbose:
                 print("[DEBUG-KUBE] Sending request...")
+            
+            # Create a system message to give better instructions
+            system_message = """You are an expert Kubernetes administrator. Your job is to diagnose and fix 
+Kubernetes issues. 
+
+Follow these guidelines:
+1. Provide specific kubectl commands for diagnostics - no placeholders, use real command syntax
+2. For each command, explain your reasoning in detail
+3. Start with read-only commands (get, describe, logs) to diagnose
+4. After diagnosis, provide specific commands to fix the issue
+5. Include verification commands to confirm the fix worked
+6. Format all commands in code blocks using markdown ```bash ... ``` format
+
+Remember to be thorough, careful, and precise in your analysis and recommendations."""
                 
             response = client.complete(
-                messages=[UserMessage(content=message)],
+                messages=[
+                    SystemMessage(content=system_message),
+                    UserMessage(content=message)
+                ],
                 max_tokens=4000,
                 temperature=0.7,
                 top_p=0.95,
@@ -366,10 +450,32 @@ Diagnose and fix the issue using kubectl.
             
             # Save to output file if provided
             if self.output_file:
-                with open(self.output_file, "a", encoding="utf-8") as f:
-                    f.write(content)
+                # Write to a temporary file first to capture LLM analysis
+                with open(self.output_file, "r", encoding="utf-8") as f:
+                    file_content = f.read()
+                
+                # Look for the Analysis and Resolution section to add the content after it
+                if "## Analysis and Resolution" in file_content:
+                    # Split the file at the Analysis and Resolution section
+                    parts = file_content.split("## Analysis and Resolution")
+                    
+                    # Write back the first part + the analysis section + the model's response
+                    with open(self.output_file, "w", encoding="utf-8") as f:
+                        f.write(parts[0])  # Header + Problem Statement
+                        f.write("## Analysis and Resolution\n\n")  # Analysis section title
+                        f.write(content)  # LLM response
+                else:
+                    # Append to the end if section not found
+                    with open(self.output_file, "a", encoding="utf-8") as f:
+                        f.write(content)
+                
                 if self.verbose:
                     print(f"[DEBUG-KUBE] Response saved to {self.output_file}")
+            
+            # Execute the suggested commands if not in read-only mode and execute is enabled
+            if not self.read_only and self.execute:
+                print("\n⚙️ Executing recommended commands...\n")
+                self._execute_commands_from_response(content)
                     
             return content
         except Exception as e:
@@ -378,3 +484,111 @@ Diagnose and fix the issue using kubectl.
                 import traceback
                 print(traceback.format_exc())
             return None
+    
+    def _execute_commands_from_response(self, response_content):
+        """
+        Extract and execute kubectl commands from the model's response.
+        
+        Args:
+            response_content (str): The content of the model's response.
+            
+        Returns:
+            None
+        """
+        import re
+        import subprocess
+        import time
+        from colorama import Fore, Style
+        
+        # Extract commands from code blocks marked with ```bash
+        # Also support other formats like ```sh or just ```
+        bash_code_blocks = re.findall(r'```(?:bash|sh|shell)?\s*(.*?)\s*```', response_content, re.DOTALL)
+        
+        if not bash_code_blocks:
+            print("[DEBUG-KUBE] No kubectl commands found in the response")
+            return
+        
+        # Initialize a list to store command execution results
+        execution_results = []
+        
+        # Create a string to collect command outputs for the summary section
+        command_outputs = "\n## OUTPUT Commands\n\n"
+        
+        # Execute each command in order
+        for i, code_block in enumerate(bash_code_blocks):
+            # Extract commands (might have multiple lines in a block)
+            commands = [cmd.strip() for cmd in code_block.split('\n') if cmd.strip()]
+            
+            for cmd in commands:
+                # Only execute kubectl commands for safety
+                if not cmd.startswith('kubectl'):
+                    print(f"[WARNING] Skipping non-kubectl command: {cmd}")
+                    continue
+                
+                print(f"\n{Fore.CYAN}> Executing command: {cmd}{Style.RESET_ALL}")
+                
+                # Execute the command
+                try:
+                    start_time = time.time()
+                    process = subprocess.Popen(
+                        cmd, 
+                        shell=True, 
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.PIPE,
+                        text=True
+                    )
+                    stdout, stderr = process.communicate()
+                    execution_time = time.time() - start_time
+                    
+                    # Display the result
+                    if process.returncode == 0:
+                        print(f"{Fore.GREEN}✓ Command completed successfully in {execution_time:.2f}s{Style.RESET_ALL}")
+                        print(f"{Fore.WHITE}{stdout}{Style.RESET_ALL}")
+                        # Add successful command to outputs
+                        command_outputs += f"> {cmd}\n{stdout}\n\n"
+                    else:
+                        print(f"{Fore.RED}✗ Command failed with exit code {process.returncode} in {execution_time:.2f}s{Style.RESET_ALL}")
+                        print(f"{Fore.RED}{stderr}{Style.RESET_ALL}")
+                        # Add failed command to outputs
+                        command_outputs += f"> {cmd}\n*Error:* {stderr}\n\n"
+                    
+                    # Store the result
+                    execution_results.append((cmd, stdout if process.returncode == 0 else stderr, process.returncode))
+                    
+                    # Write to output file if provided - individual command execution
+                    if self.output_file:
+                        with open(self.output_file, "a", encoding="utf-8") as f:
+                            f.write(f"\n### Command Execution\n\n")
+                            f.write(f"```bash\n{cmd}\n```\n\n")
+                            f.write(f"**Result:**\n\n")
+                            f.write(f"```\n{stdout if process.returncode == 0 else stderr}\n```\n\n")
+                            
+                except Exception as e:
+                    print(f"{Fore.RED}Error executing command: {str(e)}{Style.RESET_ALL}")
+                    execution_results.append((cmd, str(e), -1))
+                    # Add error to outputs
+                    command_outputs += f"> {cmd}\n*Error:* {str(e)}\n\n"
+                    
+                # Add a small delay between commands
+                time.sleep(1)
+        
+        # Summary of command execution
+        print(f"\n{Fore.CYAN}Command Execution Summary:{Style.RESET_ALL}")
+        success_count = sum(1 for _, _, code in execution_results if code == 0)
+        fail_count = sum(1 for _, _, code in execution_results if code != 0 and code != -1)
+        skip_count = sum(1 for _, _, code in execution_results if code == -1)
+        print(f"{Fore.GREEN}Successful: {success_count}{Style.RESET_ALL}")
+        print(f"{Fore.RED}Failed: {fail_count}{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Skipped: {skip_count}{Style.RESET_ALL}")
+        
+        # Write summary to output file if provided
+        if self.output_file:
+            with open(self.output_file, "a", encoding="utf-8") as f:
+                # Add the collected command outputs section after the analysis section
+                f.write(command_outputs)
+                
+                # Add execution summary
+                f.write(f"\n### Execution Summary\n\n")
+                f.write(f"- Successful: {success_count}\n")
+                f.write(f"- Failed: {fail_count}\n")
+                f.write(f"- Skipped: {skip_count}\n\n")

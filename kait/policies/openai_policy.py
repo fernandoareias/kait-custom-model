@@ -40,16 +40,12 @@ class OpenAIStrategy(LLMStrategy):
         self.verbose = verbose
         self.timeout = timeout
         
-        # Check API key
         if len(api_key) < 10:
             print("[WARNING] API key seems too short, might be invalid")
         print(f"[DEBUG] API Key (first/last 5 chars): {api_key[:5]}...{api_key[-5:] if len(api_key) > 10 else ''}")
         
-        # Check endpoint URL
         print(f"[DEBUG] Endpoint URL: {endpoint}")
         
-        # Extract model name from endpoint URL
-        # Example: https://testehub2096476304.openai.azure.com/openai/deployments/gpt-4o-mini
         match = re.search(r"/deployments/([^/]+)/?$", endpoint)
         if not match:
             error_msg = "Invalid endpoint URL. Expected format: .../deployments/model-name"
@@ -60,7 +56,6 @@ class OpenAIStrategy(LLMStrategy):
         print(f"[DEBUG] Extracted model name: {self.model_name}")
         print(f"[DEBUG] Timeout set to: {self.timeout} seconds")
         
-        # Check network connectivity to the endpoint
         try:
             hostname = re.match(r'https?://([^/]+)', endpoint)
             if hostname:
@@ -80,7 +75,6 @@ class OpenAIStrategy(LLMStrategy):
             )
             print("[DEBUG] ChatCompletionsClient created successfully")
             
-            # Add usage summary attributes with the correct format
             print("[DEBUG] Initializing usage statistics")
             usage_summary = {
                 self.model_name: {
@@ -213,28 +207,51 @@ class OpenAIStrategy(LLMStrategy):
                 
                 print(f"[AGENT] Current message history count: {len(self.messages)}")
                 
-                # Simplified implementation - always provide a simple response for testing
                 if request_reply:
-                    print("[AGENT] Request for reply received. Providing simple direct response instead of calling API")
+                    print("[AGENT] Generating real response from Azure OpenAI API")
                     
-                    # Get a simple message based on the input
-                    input_content = content.lower()
-                    if "ola mundo" in input_content:
-                        reply = "Olá! Vou verificar o estado do seu cluster Kubernetes.\n\nPrimeiro, vamos listar os nodes disponíveis para entender a configuração do cluster.\n\n```bash\nkubectl get nodes\n```"
-                    else:
-                        reply = "Para diagnosticar o problema, vou verificar os recursos no cluster Kubernetes.\n\nPrimeiro, vamos listar os namespaces:\n\n```bash\nkubectl get namespaces\n```"
-                    
-                    print(f"[AGENT] Simplified response: {reply[:100]}...")
-                    self.messages.append({"role": "assistant", "content": reply})
-                    self._last_message = {"content": reply}
-                    
-                    # Call reply functions if registered
-                    for i, (reply_func, (trigger, config)) in enumerate(zip(self.reply_func_list, self.reply_func_list_args)):
-                        if reply_func:
-                            print(f"[AGENT] Calling reply function #{i}: {reply_func}")
-                            reply_func(self.name, [{"content": reply}], sender, config or {})
-                    
-                    return True, reply
+                    try:
+                        azure_messages = []
+                        for msg in self.messages:
+                            if msg.get("role") == "system":
+                                azure_messages.append(SystemMessage(content=msg["content"]))
+                            else:
+                                azure_messages.append(UserMessage(content=msg["content"]))
+                        
+                        print(f"[AGENT] Converted {len(azure_messages)} messages for API request")
+                        
+                        response = self.client.complete(
+                            messages=azure_messages,
+                            max_tokens=4096,
+                            temperature=0.7,
+                            top_p=0.95,
+                            model=self.model_name,
+                        )
+                        
+                        reply = response.choices[0].message.content
+                        print(f"[AGENT] Received API response: {reply[:100]}...")
+                        
+                        self.messages.append({"role": "assistant", "content": reply})
+                        self._last_message = {"content": reply}
+                        
+                        for i, (reply_func, (trigger, config)) in enumerate(zip(self.reply_func_list, self.reply_func_list_args)):
+                            if reply_func:
+                                print(f"[AGENT] Calling reply function #{i}: {reply_func}")
+                                reply_func(self.name, [{"content": reply}], sender, config or {})
+                        
+                        return True, reply
+                        
+                    except Exception as e:
+                        error_message = f"Error generating response: {str(e)}"
+                        print(f"[ERROR] {error_message}")
+                        import traceback
+                        print(traceback.format_exc())
+                        
+                        # Return a fallback response in case of error
+                        fallback_reply = "I encountered an error while processing your request. Please check the logs for more details."
+                        self.messages.append({"role": "assistant", "content": fallback_reply})
+                        self._last_message = {"content": fallback_reply}
+                        return True, fallback_reply
                 
                 return False, None
 
