@@ -11,7 +11,7 @@
 You can install `kait` directly using pip:
 
 ```bash
-pip install kait
+pip install kait-custom-model
 ```
 
 `kait` requires an OpenAI API key which is read via the environment variable KAIT_OPENAI_KEY. You can provide a list of models to use and `kait` will use the available model. It is recommended to use models with the capabilities of gpt-4. Larger contexts work better too e.g. 'gpt-4-1106-preview'. Your environment variable needs to point to a list of models in the following format:
@@ -133,3 +133,35 @@ kait debug --help
 ## Examples
 
 A number of [examples/](examples/README.md) are provided so you can see how `kait` performs.
+
+## Credits
+
+### Original Project
+
+This project is a fork of [KAIT (Kubernetes AI Tool)](https://github.com/asaharland/kait) by Asa Harland. The original project provides an excellent foundation for AI-assisted Kubernetes debugging using OpenAI models.
+
+### Custom Model Enhancements
+
+This fork adds several key enhancements to the original project:
+
+1. **Multiple LLM Provider Support**:
+   - Added a policy-based architecture allowing users to choose between different LLM providers
+   - Implemented support for both `openai` and `autogen` policies
+   - Created a flexible interface for adding more providers in the future
+
+2. **Azure OpenAI Integration**:
+   - Added direct integration with Azure OpenAI API
+   - Simplified configuration requiring only endpoint and API key parameters
+   - Implemented robust error handling and network connectivity checks
+
+3. **Command Execution Control**:
+   - Added `--execute` flag to control whether commands are automatically executed
+   - By default, the tool generates analysis without executing commands
+   - Commands are only executed when explicitly requested via the flag
+
+4. **Enhanced Debugging**:
+   - Added verbose logging options
+   - Improved error handling and diagnostics
+   - Better documentation of debugging steps
+
+Thank you to all contributors of the original project for creating such a valuable tool for the Kubernetes community!
